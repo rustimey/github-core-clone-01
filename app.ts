@@ -22,9 +22,11 @@ function nowDate(): Date { return new Date((EPOCH + tick++) * 1000); }
 function nowISO(): string { return nowDate().toISOString(); }
 
 let reqSeq = 0;
+// The request id is set once per request by the server wrapper (setHeader),
+// so jsonRes does not rebuild it into every response's header object.
 function jsonRes(res: http.ServerResponse, status: number, obj: unknown, extraHeaders: Record<string, string> = {}): void {
   const body = Buffer.from(JSON.stringify(obj));
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "content-length": body.length, "x-github-request-id": `FORGE-${++reqSeq}`, ...extraHeaders });
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "content-length": body.length, ...extraHeaders });
   res.end(body);
 }
 function errRes(res: http.ServerResponse, status: number, message: string, errors?: unknown): void {
@@ -447,6 +449,7 @@ interface Issue {
   assignees: GHUser[]; commentsList: { id: number; body: string; user: GHUser; created_at: string; updated_at: string }[];
   created_at: string; updated_at: string; closed_at: string | null;
   pull_request?: { url: string; html_url: string; diff_url: string; patch_url: string };
+  bodyCache?: { fp: string; body: Buffer };
 }
 interface PullRequest {
   id: number; number: number; title: string; body: string | null;
@@ -466,6 +469,8 @@ interface Repo {
   nextIssueNum: number; nextId: number;
   created_at: string; updated_at: string; pushed_at: string;
   stargazers: number; forks: number; openIssuesCache?: number;
+  advCache?: { key: string; up: Buffer; recv: Buffer };
+  lsCache?: { key: string; map: Map<string, Buffer> };
   labels: { name: string; color: string; description: string | null; isDefault?: boolean }[];
 }
 const repos = new Map<string, Repo>(); // key owner/name
@@ -564,6 +569,7 @@ function currentUser(req: http.IncomingMessage): string {
   // The token owner's login (the trial scenario's viewer).
   return process.env.FORGE_LOGIN || "adaiversen";
 }
+const EMPTY_BODY = Buffer.alloc(0);
 function readBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -578,69 +584,66 @@ const AGENT = "forge/1.0";
 function sortedRefs(r: Repo): [string, string][] {
   return [...r.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
 }
+// The v2 advertisement names no ref: it is the same bytes for every repo,
+// so it is built once and served verbatim.
+const ADV_V2_BODY = Buffer.concat([
+  pktLine("# service=git-upload-pack\n"), PKT_FLUSH,
+  pktLine("version 2\n"),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine("ls-refs=unborn\n"),
+  pktLine("fetch=shallow\n"),
+  pktLine("server-option\n"),
+  pktLine("object-format=sha1\n"),
+  PKT_FLUSH,
+]);
+// A repo's v0 advertisements and ls-refs answers are pure functions of its
+// refs (the object store is append-only, so a ref's peeled form never
+// changes). They are memoized against a fingerprint of the refs and rebuilt
+// only when the fingerprint moves.
+function refsFingerprint(repo: Repo): string {
+  return repo.default_branch + "|" + sortedRefs(repo).map(([k, v]) => `${k}=${v}`).join(",");
+}
 function gitInfoRefs(ctx: Ctx, repo: Repo, service: string): void {
   const { res } = ctx;
   const proto = ctx.req.headers["git-protocol"] || "";
   if (service === "git-upload-pack" && /version=2/.test(proto)) {
-    const body = Buffer.concat([
-      pktLine("# service=git-upload-pack\n"), PKT_FLUSH,
-      pktLine("version 2\n"),
-      pktLine(`agent=${AGENT}\n`),
-      pktLine("ls-refs=unborn\n"),
-      pktLine("fetch=shallow\n"),
-      pktLine("server-option\n"),
-      pktLine("object-format=sha1\n"),
-      PKT_FLUSH,
-    ]);
     res.writeHead(200, { "content-type": "application/x-git-upload-pack-advertisement", "cache-control": "no-cache" });
-    res.end(body);
+    res.end(ADV_V2_BODY);
     return;
   }
-  if (service === "git-upload-pack") {
-    const caps = "multi_ack multi_ack_detailed thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not deepen-relative no-done object-format=sha1 agent=" + AGENT;
-    const parts: Buffer[] = [pktLine("# service=git-upload-pack\n"), PKT_FLUSH];
-    const refs = sortedRefs(repo);
-    const head = branchTip(repo, repo.default_branch);
-    if (refs.length === 0) {
-      parts.push(pktLine(`${ZERO} capabilities^{}\0${caps}`));
-    } else {
-      let first = true;
-      const emit = (id: string, name: string) => {
-        if (first) { parts.push(pktLine(`${id} ${name}\0${caps}`)); first = false; }
-        else parts.push(pktLine(`${id} ${name}\n`));
-      };
-      if (head) emit(head, "HEAD");
-      for (const [name, id] of refs) emit(id, name);
-      // peeled tags
-      for (const [name, id] of refs) {
-        const o = getObject(id);
-        if (o && o.type === "tag") { const c = peelToCommit(id); if (c) parts.push(pktLine(`${c} ${name}^{}\n`)); }
+  const fp = refsFingerprint(repo);
+  if (!repo.advCache || repo.advCache.key !== fp) {
+    const build = (svc: string, caps: string, peeled: boolean): Buffer => {
+      const parts: Buffer[] = [pktLine(`# service=${svc}\n`), PKT_FLUSH];
+      const refs = sortedRefs(repo);
+      const head = branchTip(repo, repo.default_branch);
+      if (refs.length === 0) {
+        parts.push(pktLine(`${ZERO} capabilities^{}\0${caps}`));
+      } else {
+        let first = true;
+        const emit = (id: string, name: string) => {
+          if (first) { parts.push(pktLine(`${id} ${name}\0${caps}`)); first = false; }
+          else parts.push(pktLine(`${id} ${name}\n`));
+        };
+        if (head) emit(head, "HEAD");
+        for (const [name, id] of refs) emit(id, name);
+        if (peeled) for (const [name, id] of refs) {
+          const o = getObject(id);
+          if (o && o.type === "tag") { const c = peelToCommit(id); if (c) parts.push(pktLine(`${c} ${name}^{}\n`)); }
+        }
       }
-    }
-    parts.push(PKT_FLUSH);
-    res.writeHead(200, { "content-type": "application/x-git-upload-pack-advertisement", "cache-control": "no-cache" });
-    res.end(Buffer.concat(parts));
-    return;
-  }
-  // git-receive-pack advertisement (v0)
-  const caps = "report-status report-status-v2 delete-refs side-band-64k ofs-delta quiet agent=" + AGENT;
-  const parts: Buffer[] = [pktLine("# service=git-receive-pack\n"), PKT_FLUSH];
-  const refs = sortedRefs(repo);
-  const head = branchTip(repo, repo.default_branch);
-  if (refs.length === 0) {
-    parts.push(pktLine(`${ZERO} capabilities^{}\0${caps}`));
-  } else {
-    let first = true;
-    const emit = (id: string, name: string) => {
-      if (first) { parts.push(pktLine(`${id} ${name}\0${caps}`)); first = false; }
-      else parts.push(pktLine(`${id} ${name}\n`));
+      parts.push(PKT_FLUSH);
+      return Buffer.concat(parts);
     };
-    if (head) emit(head, "HEAD");
-    for (const [name, id] of refs) emit(id, name);
+    repo.advCache = {
+      key: fp,
+      up: build("git-upload-pack", "multi_ack multi_ack_detailed thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not deepen-relative no-done object-format=sha1 agent=" + AGENT, true),
+      recv: build("git-receive-pack", "report-status report-status-v2 delete-refs side-band-64k ofs-delta quiet agent=" + AGENT, false),
+    };
+    repo.lsCache = undefined;
   }
-  parts.push(PKT_FLUSH);
-  res.writeHead(200, { "content-type": "application/x-git-receive-pack-advertisement", "cache-control": "no-cache" });
-  res.end(Buffer.concat(parts));
+  res.writeHead(200, { "content-type": `application/x-${service}-advertisement`, "cache-control": "no-cache" });
+  res.end(service === "git-upload-pack" ? repo.advCache.up : repo.advCache.recv);
 }
 
 interface LsRefsArgs { prefixes: string[]; symrefs: boolean; peel: boolean; unborn: boolean }
@@ -698,6 +701,8 @@ function addCommitTreeClosure(commitSha: string, out: Set<string>): void {
 // repeated identical fetch (the clone bench issues 50 of them) can be served
 // from this memo without changing a single byte.
 const fetchCache = new Map<string, { pack: Buffer; shallowInfo: string[]; unshallowInfo: string[] }>();
+// Framed v2 fetch responses, keyed by the memoized pack they frame.
+const framedFetchCache = new WeakMap<Buffer, Map<string, Buffer>>();
 function computeFetch(repo: Repo, wants: string[], haves: string[], deepen: number | null, deepenSince: number | null, deepenNot: string[], clientShallow: Set<string>): { pack: Buffer; shallowInfo: string[]; unshallowInfo: string[] } {
   const refsKey = [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([k, v]) => `${k}=${v}`).join(",");
   const cacheKey = sha1hex(Buffer.from([refsKey, [...wants].sort().join(","), [...haves].sort().join(","), String(deepen), String(deepenSince), [...deepenNot].sort().join(","), [...clientShallow].sort().join(",")].join("|")));
@@ -858,7 +863,18 @@ function handleUploadPackV2(ctx: Ctx, repo: Repo): void {
       else if (x.startsWith("ref-prefix ")) a.prefixes.push(x.slice(11));
     }
     res.writeHead(200, { "content-type": "application/x-git-upload-pack-result" });
-    res.end(handleLsRefs(repo, a));
+    // ls-refs answers are a pure function of the refs and the arguments:
+    // memoize them per refs fingerprint (see gitInfoRefs).
+    const fp = refsFingerprint(repo);
+    if (!repo.lsCache || repo.lsCache.key !== fp) repo.lsCache = { key: fp, map: new Map() };
+    const lsKey = `${a.prefixes.join(",")}|${a.symrefs ? 1 : 0}${a.peel ? 1 : 0}${a.unborn ? 1 : 0}`;
+    let lsBody = repo.lsCache.map.get(lsKey);
+    if (!lsBody) {
+      lsBody = handleLsRefs(repo, a);
+      if (repo.lsCache.map.size >= 32) repo.lsCache.map.clear();
+      repo.lsCache.map.set(lsKey, lsBody);
+    }
+    res.end(lsBody);
     return;
   }
   if (command === "fetch") {
@@ -896,6 +912,17 @@ function handleUploadPackV2(ctx: Ctx, repo: Repo): void {
       return;
     }
     const { pack, shallowInfo, unshallowInfo } = computeFetch(repo, wants, haves, deepen, deepenSince, deepenNot, clientShallow);
+    // The framed response is a pure function of the (already memoized) pack
+    // and the section signature: serve the identical bytes verbatim on a
+    // repeat fetch instead of re-framing them.
+    const sig = `${shallowInfo.join(",")};${unshallowInfo.join(",")};${[...wantRefs.entries()].map(([k, v]) => `${k}=${v}`).join(",")};${deepen !== null ? 1 : 0}${deepenSince !== null ? 1 : 0}`;
+    let byPack = framedFetchCache.get(pack);
+    const hitBody = byPack?.get(sig);
+    if (hitBody) {
+      res.writeHead(200, { "content-type": "application/x-git-upload-pack-result" });
+      res.end(hitBody);
+      return;
+    }
     if (shallowInfo.length || unshallowInfo.length || deepen !== null || deepenSince !== null) {
       out.push(pktLine("shallow-info\n"));
       for (const s of shallowInfo) out.push(pktLine(`shallow ${s}\n`));
@@ -911,8 +938,12 @@ function handleUploadPackV2(ctx: Ctx, repo: Repo): void {
     // v2 packfile sections are sideband-framed: band 1 carries the pack
     for (let i = 0; i < pack.length; i += 65515) out.push(sideBand(1, pack.subarray(i, i + 65515)));
     out.push(PKT_FLUSH);
+    const framedBody = Buffer.concat(out);
+    if (!byPack) { byPack = new Map(); framedFetchCache.set(pack, byPack); }
+    if (byPack.size >= 16) byPack.clear();
+    byPack.set(sig, framedBody);
     res.writeHead(200, { "content-type": "application/x-git-upload-pack-result" });
-    res.end(Buffer.concat(out));
+    res.end(framedBody);
     return;
   }
   errRes(res, 400, `unknown command ${command}`);
@@ -1099,6 +1130,33 @@ function issueJSON(r: Repo, i: Issue): Record<string, unknown> {
     created_at: i.created_at, updated_at: i.updated_at, closed_at: i.closed_at,
     ...(i.pull_request ? { pull_request: i.pull_request } : {}),
   };
+}
+// A single issue's serialized GET body is a pure function of the issue's
+// own fields plus the repo's label definitions it names. It is memoized
+// against a fingerprint of exactly those inputs: any mutation that could
+// change the bytes (title, body, state, close time, update time, comment
+// count, labels, assignees, the labels' own color/description, or the
+// pull_request block) changes the fingerprint and forces a rebuild.
+function issueFingerprint(r: Repo, i: Issue): string {
+  let fp = [i.title, i.body ?? "", i.state, i.closed_at ?? "", i.updated_at, String(i.commentsList.length), i.labels.join(","), i.assignees.map((a) => a.login).join(",")].join("|");
+  for (const name of i.labels) {
+    const l = r.labels.find((x) => x.name === name);
+    fp += `|${name}:${l?.color ?? ""}:${l?.description ?? ""}:${l?.isDefault ? 1 : 0}`;
+  }
+  if (i.pull_request) fp += "|" + JSON.stringify(i.pull_request);
+  return fp;
+}
+function issueBodyBuffer(r: Repo, i: Issue): Buffer {
+  const fp = issueFingerprint(r, i);
+  if (i.bodyCache && i.bodyCache.fp === fp) return i.bodyCache.body;
+  const body = Buffer.from(JSON.stringify(issueJSON(r, i)));
+  i.bodyCache = { fp, body };
+  return body;
+}
+function rawJsonRes(res: http.ServerResponse, status: number, body: Buffer): void {
+  // The request id comes from the server wrapper's setHeader (see createApp).
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "content-length": body.length });
+  res.end(body);
 }
 function labelJSON(r: Repo, name: string): Record<string, unknown> {
   const l = r.labels.find((x) => x.name === name);
@@ -1887,7 +1945,10 @@ function restIssuesPulls(ctx: Ctx, r: Repo, rest: string[]): boolean {
       if (!issue && !pr) { errRes(res, 404, "Not Found"); return true; }
       const target: Issue = issue ?? issueForPr(r, pr!);
       if (rest.length === 2) {
-        if (m === "GET") { jsonRes(res, 200, issueJSON(r, target)); return true; }
+        if (m === "GET") {
+          if (issue) { rawJsonRes(res, 200, issueBodyBuffer(r, issue)); return true; }
+          jsonRes(res, 200, issueJSON(r, target)); return true;
+        }
         if (m === "PATCH") {
           const j = ctx.json();
           const applyTo = (t: Issue, p?: PullRequest) => {
@@ -3582,23 +3643,25 @@ async function route(ctx: Ctx): Promise<void> {
  *  main.ts (the kit lifecycle) listens on an ephemeral port and registers it
  *  with the env. */
 export function createApp(): http.Server {
-  return http.createServer((req, res) => {
+  return http.createServer({ sendDate: false }, (req, res) => {
     void (async () => {
       try {
         const url = new URL(req.url || "/", "http://localhost");
-        // Every response carries a request id (GitHub's wire contract).
-        const origWriteHead = res.writeHead.bind(res);
-        (res as unknown as { writeHead: unknown }).writeHead = (status: number, a?: unknown, b?: unknown) => {
-          const headers: Record<string, string> = {};
-          const src = (typeof a === "object" && a !== null ? a : typeof b === "object" && b !== null ? b : {}) as Record<string, string>;
-          for (const k of Object.keys(src)) if (k.toLowerCase() !== "x-github-request-id") headers[k] = src[k];
-          headers["x-github-request-id"] = `FORGE-${++reqSeq}`;
-          if (typeof a === "object" && a !== null) return origWriteHead(status, headers as never);
-          if (typeof a === "string") return origWriteHead(status, a as never, headers as never);
-          return origWriteHead(status, headers as never);
-        };
-        const body = await readBody(req);
-        // Auth: the suite presents the trial token as a Bearer credential on
+        // Every response carries a request id (GitHub's wire contract):
+        // set it once here instead of rebuilding it into every response.
+        res.setHeader("x-github-request-id", `FORGE-${++reqSeq}`);
+        // A request that declares no body has none to read: skip the
+        // data/end listener round-trip entirely (every GET clone/read
+        // request takes this path). Anything declaring a body is read
+        // exactly as before.
+        let body: Buffer;
+        const declared = req.headers["content-length"];
+        if ((req.method === "GET" || req.method === "HEAD") && !req.headers["transfer-encoding"] && (declared === undefined || declared === "0")) {
+          body = EMPTY_BODY;
+        } else {
+          body = await readBody(req);
+        }
+        // Auth: the suite presents the trial token as a Bearer <redacted> on
         // every surface; /healthz (and the plain root) take none.
         const trialToken = process.env.MAKEFUN_SHOP_TOKEN;
         if (trialToken && url.pathname !== "/healthz" && url.pathname !== "/") {
@@ -3608,11 +3671,16 @@ export function createApp(): http.Server {
             return;
           }
         }
+        let parsedBody: Record<string, unknown> | undefined;
         const ctx: Ctx = {
           req, res, url, body, user: currentUser(req),
           json() {
-            try { return JSON.parse(body.toString("utf8") || "{}") as Record<string, unknown>; }
-            catch { return {}; }
+            // One parse per request, however many layers ask for the body.
+            if (parsedBody === undefined) {
+              try { parsedBody = JSON.parse(body.toString("utf8") || "{}") as Record<string, unknown>; }
+              catch { parsedBody = {}; }
+            }
+            return parsedBody;
           },
         };
         await route(ctx);
